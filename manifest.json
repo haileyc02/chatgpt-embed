@@ -1,0 +1,9 @@
+{
+  "id": "chatgpt-embed",
+  "name": "ChatGPT Embed",
+  "version": "1.4.0",
+  "minAppVersion": "1.0.0",
+  "description": "在 Obsidian 侧边栏或标签页中打开 ChatGPT 网页。",
+  "author": "Hailey",
+  "isDesktopOnly": true
+}

@@ -1,0 +1,49 @@
+.chatgpt-embed-container {
+  display: flex;
+  flex-direction: column;
+  padding: 0 !important;
+  overflow: hidden;
+}
+
+.chatgpt-embed-toolbar {
+  display: flex;
+  gap: 2px;
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  flex: 0 0 auto;
+}
+
+.chatgpt-embed-webview {
+  flex: 1 1 auto;
+  width: 100%;
+  height: 100%;
+  border: none;
+}
+
+.chatgpt-embed-cookie-input {
+  width: 100%;
+  min-height: 90px;
+  font-family: var(--font-monospace);
+  font-size: 12px;
+}
+
+.chatgpt-embed-diag {
+  max-height: 50vh;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-size: 12px;
+  user-select: text;
+}
+
+.chatgpt-embed-cookie-modal .chatgpt-embed-field { margin: 10px 0; }
+.chatgpt-embed-cookie-modal label {
+  display: block;
+  font-family: var(--font-monospace);
+  font-size: 12px;
+  margin-bottom: 4px;
+}
+.chatgpt-embed-hint { font-size: 11px; color: var(--text-muted); min-height: 1em; }
+.chatgpt-embed-advanced { margin: 10px 0; font-size: 12px; }
+.chatgpt-embed-advanced summary { cursor: pointer; color: var(--text-muted); }
+.chatgpt-embed-status { min-height: 1.4em; margin: 6px 0; font-size: 13px; }
