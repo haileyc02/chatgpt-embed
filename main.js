@@ -20,6 +20,8 @@ const DEFAULT_SETTINGS = {
   userAgent: "", // empty = auto: a clean Chrome UA matching Obsidian's real Chromium version
   googleFirefoxUA: true, // only on accounts.google.com, to get past "browser may not be secure"
   chromePath: "", // empty = auto-detect
+  screenshotDir: "", // empty = the OS screenshot folder
+  watchClipboard: true, // also pick up screenshots copied to the clipboard
 };
 
 // ---------- "Log in with Chrome" (CDP) helpers ----------
@@ -188,6 +190,128 @@ function getElectronSession() {
   }
 }
 
+// ---------- Screenshot watcher ----------
+// While enabled, screenshots the user takes with the OS shortcuts are pasted into ChatGPT:
+//  - saved to a file (macOS Cmd+Shift+3/4/5, Windows 11 Snipping Tool): watch the screenshot folder
+//  - copied to the clipboard (macOS Cmd+Ctrl+Shift+4, Windows Win+Shift+S / PrtSc): poll the clipboard
+
+const IMAGE_EXT = /\.(png|jpe?g)$/i;
+
+// Where the OS saves screenshots. macOS honours a custom location set in Cmd+Shift+5 → Options.
+async function defaultScreenshotDir() {
+  const os = require("os");
+  const path = require("path");
+  if (process.platform === "darwin") {
+    const loc = await new Promise((resolve) =>
+      require("child_process").execFile("defaults", ["read", "com.apple.screencapture", "location"], (err, out) =>
+        resolve(err ? "" : String(out).trim())
+      )
+    );
+    if (loc) return loc.replace(/^~(?=$|\/)/, os.homedir());
+    return path.join(os.homedir(), "Desktop");
+  }
+  return path.join(os.homedir(), "Pictures", "Screenshots");
+}
+
+// Cheap fingerprint of a clipboard image, to notice when it changes.
+function imageSignature(img) {
+  if (!img || img.isEmpty()) return "";
+  const { width, height } = img.getSize();
+  const buf = img.toBitmap();
+  const step = Math.max(1, Math.floor(buf.length / 256));
+  let s = `${width}x${height}:`;
+  for (let i = 0; i < buf.length; i += step) s += buf[i].toString(16);
+  return s;
+}
+
+// Resolves once the file stops growing (macOS writes it in several steps).
+async function waitForStableFile(file) {
+  const fs = require("fs");
+  let last = -1;
+  for (let i = 0; i < 20; i++) {
+    let size;
+    try { size = fs.statSync(file).size; } catch (e) { return false; }
+    if (size > 0 && size === last) return true;
+    last = size;
+    await sleep(250);
+  }
+  return last > 0;
+}
+
+class ScreenshotWatcher {
+  constructor(plugin) {
+    this.plugin = plugin;
+    this.fsWatcher = null;
+    this.timer = null;
+    this.seenFiles = new Set();
+    this.lastClipSig = "";
+  }
+
+  async start() {
+    const fs = require("fs");
+    const { clipboard } = require("electron");
+    const dir = this.plugin.settings.screenshotDir || (await defaultScreenshotDir());
+    this.dir = dir;
+    try {
+      this.fsWatcher = fs.watch(dir, (event, name) => name && this.onFile(name));
+    } catch (e) {
+      this.fsWatcher = null;
+      console.error("chatgpt-embed: cannot watch", dir, e);
+      new Notice(`无法监听截图文件夹：${dir}\n只能接收复制到剪贴板的截图。可以在插件设置里修改文件夹。`, 10000);
+    }
+    if (this.plugin.settings.watchClipboard) {
+      // Whatever is on the clipboard right now is old; only react to changes.
+      try { this.lastClipSig = imageSignature(clipboard.readImage()); } catch (e) {}
+      this.timer = window.setInterval(() => this.pollClipboard(), 800);
+    }
+  }
+
+  stop() {
+    if (this.fsWatcher) this.fsWatcher.close();
+    if (this.timer) window.clearInterval(this.timer);
+    this.fsWatcher = null;
+    this.timer = null;
+  }
+
+  async onFile(name) {
+    // macOS writes a hidden ".Screenshot…" temp file first, then renames it.
+    if (name.startsWith(".") || !IMAGE_EXT.test(name) || this.seenFiles.has(name)) return;
+    const fs = require("fs");
+    const path = require("path");
+    const file = path.join(this.dir, name);
+    let st;
+    try { st = fs.statSync(file); } catch (e) { return; } // deleted / renamed away
+    // Only new files, not ones moved or touched in the folder.
+    if (Date.now() - st.birthtimeMs > 15000) return;
+    this.seenFiles.add(name);
+    if (!(await waitForStableFile(file))) return;
+    const img = require("electron").nativeImage.createFromPath(file);
+    if (!img.isEmpty()) this.plugin.queueImage(img);
+  }
+
+  pollClipboard() {
+    const { clipboard } = require("electron");
+    let formats;
+    try { formats = clipboard.availableFormats(); } catch (e) { return; }
+    if (!formats.some((f) => f.startsWith("image/"))) return;
+    const img = clipboard.readImage();
+    const sig = imageSignature(img);
+    if (!sig || sig === this.lastClipSig) return;
+    this.lastClipSig = sig;
+    this.plugin.queueImage(img);
+  }
+}
+
+// Focuses ChatGPT's composer; resolves true if it was found.
+const FOCUS_COMPOSER_JS = `(() => {
+  const el = document.querySelector("#prompt-textarea")
+    || document.querySelector("form [contenteditable='true']")
+    || document.querySelector("form textarea");
+  if (!el) return false;
+  el.focus();
+  return true;
+})()`;
+
 class TextModal extends Modal {
   constructor(app, title, text) {
     super(app);
@@ -337,6 +461,8 @@ class ChatGPTView extends ItemView {
       const u = this.webview?.getURL?.() || this.plugin.settings.url;
       window.open(u);
     });
+    this.shotBtn = btn("camera", "自动把截图放入输入框（开/关）", () => this.plugin.toggleScreenshotWatch());
+    this.updateShotButton();
     btn("log-in", "用 Chrome 登录（推荐，Google 账号用这个）", () => this.plugin.loginWithChrome());
     btn("key-round", "手动导入登录 Cookie", () =>
       new CookieImportModal(this.app, this.plugin).open()
@@ -377,6 +503,14 @@ class ChatGPTView extends ItemView {
     });
   }
 
+  updateShotButton() {
+    if (!this.shotBtn) return;
+    const on = !!this.plugin.screenshotWatcher;
+    this.shotBtn.toggleClass("is-active", on);
+    setIcon(this.shotBtn, on ? "camera" : "camera-off");
+    this.shotBtn.setAttr("aria-label", on ? "自动放入截图：已开启（点击关闭）" : "自动放入截图：已关闭（点击开启）");
+  }
+
   async onClose() {
     this.webview = null;
     this.contentEl.empty();
@@ -413,6 +547,12 @@ class ChatGPTEmbedPlugin extends Plugin {
     });
 
     this.addCommand({
+      id: "toggle-screenshot-watch",
+      name: "开启/关闭：自动把截图放入 ChatGPT 输入框",
+      callback: () => this.toggleScreenshotWatch(),
+    });
+
+    this.addCommand({
       id: "login-with-chrome",
       name: "用 Chrome 登录 ChatGPT（自动同步登录状态）",
       callback: () => this.loginWithChrome(),
@@ -438,6 +578,63 @@ class ChatGPTEmbedPlugin extends Plugin {
       .getLeavesOfType(VIEW_TYPE)
       .map((l) => l.view && l.view.webview)
       .filter(Boolean);
+  }
+
+  async toggleScreenshotWatch() {
+    if (this.screenshotWatcher) {
+      this.screenshotWatcher.stop();
+      this.screenshotWatcher = null;
+      new Notice("已关闭：截图不再自动放入 ChatGPT");
+    } else {
+      const w = new ScreenshotWatcher(this);
+      this.screenshotWatcher = w;
+      await w.start();
+      new Notice(`已开启：之后的截图会自动放入 ChatGPT 输入框\n监听文件夹：${w.dir}`, 6000);
+    }
+    for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE)) leaf.view.updateShotButton?.();
+  }
+
+  // Screenshots can arrive back to back; paste them one at a time.
+  queueImage(img) {
+    // Windows 11 puts the same screenshot on the clipboard and in the folder: send it once.
+    const sig = imageSignature(img);
+    this.recentShots = this.recentShots || [];
+    if (this.recentShots.includes(sig)) return;
+    this.recentShots.push(sig);
+    if (this.recentShots.length > 10) this.recentShots.shift();
+
+    this._shotQueue = (this._shotQueue || Promise.resolve())
+      .then(() => this.insertImage(img, sig))
+      .catch((e) => console.error("chatgpt-embed: insert screenshot failed", e));
+  }
+
+  async insertImage(img, sig) {
+    const { clipboard } = require("electron");
+    await this.activateView();
+    const wv = this.getWebviews()[0];
+    if (!wv) return new Notice("没有可用的 ChatGPT 视图");
+
+    // The view may have just opened: wait for the composer to render.
+    let found = false;
+    for (let i = 0; i < 40 && !found; i++) {
+      try {
+        wv.focus();
+        found = await wv.executeJavaScript(FOCUS_COMPOSER_JS);
+      } catch (e) {}
+      if (!found) await sleep(250);
+    }
+
+    // Paste through the clipboard, same as the user pressing Cmd/Ctrl+V.
+    // Tell the clipboard poller this image is ours so it isn't sent again.
+    clipboard.writeImage(img);
+    if (this.screenshotWatcher) this.screenshotWatcher.lastClipSig = sig;
+    if (!found) {
+      new Notice("没找到 ChatGPT 输入框（是否已登录？）。截图已复制到剪贴板，可以手动粘贴。", 8000);
+      return;
+    }
+    wv.paste();
+    new Notice("截图已放入 ChatGPT 输入框");
+    await sleep(300);
   }
 
   log(msg) {
@@ -712,7 +909,10 @@ class ChatGPTEmbedPlugin extends Plugin {
     }
   }
 
-  onunload() {}
+  onunload() {
+    if (this.screenshotWatcher) this.screenshotWatcher.stop();
+    this.screenshotWatcher = null;
+  }
 
   async activateView(where) {
     const loc = where || this.settings.openLocation;
@@ -807,6 +1007,27 @@ class ChatGPTSettingTab extends PluginSettingTab {
       .addToggle((t) =>
         t.setValue(this.plugin.settings.googleFirefoxUA).onChange(async (v) => {
           this.plugin.settings.googleFirefoxUA = v;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("截图文件夹")
+      .setDesc("开启“自动放入截图”后监听这个文件夹里新出现的截图。留空 = 系统默认（macOS 读取截图设置，通常是桌面）。修改后请关掉再打开开关。")
+      .addText((t) => {
+        t.setValue(this.plugin.settings.screenshotDir).onChange(async (v) => {
+          this.plugin.settings.screenshotDir = v.trim();
+          await this.plugin.saveSettings();
+        });
+        defaultScreenshotDir().then((d) => t.setPlaceholder(d));
+      });
+
+    new Setting(containerEl)
+      .setName("也接收复制到剪贴板的截图")
+      .setDesc("例如 macOS 的 Cmd+Ctrl+Shift+4、Windows 的 Win+Shift+S。注意：开启时，从别处复制的图片也会被放进去。")
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.watchClipboard).onChange(async (v) => {
+          this.plugin.settings.watchClipboard = v;
           await this.plugin.saveSettings();
         })
       );
